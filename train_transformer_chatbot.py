@@ -9,6 +9,7 @@ import os
 from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoTokenizer
+import glob
 
 # Set random seed for reproducibility
 seed = 42
@@ -138,9 +139,9 @@ class TransformerChatbot(nn.Module):
         return mask
 
 # Training function with mixed precision for MPS
-def train(model, dataloader, optimizer, criterion, device, epochs=10):
+def train(model, dataloader, optimizer, criterion, device, start_epoch=0, epochs=10):
     model.train()
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         total_loss = 0
         for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}"):
             src = batch["input"].to(device)
@@ -163,6 +164,21 @@ def train(model, dataloader, optimizer, criterion, device, epochs=10):
             optimizer.step()
             total_loss += loss.item()
         print(f"Epoch {epoch + 1}, Loss: {total_loss / len(dataloader):.4f}")
+        # Save checkpoint after each epoch
+        checkpoint_path = f"models/chatbot_epoch_{epoch+1}.pth"
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'tokenizer': tokenizer.name_or_path
+        }, checkpoint_path)
+        # Also save latest checkpoint for test script compatibility
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'tokenizer': tokenizer.name_or_path
+        }, 'transformer_chatbot.pth')
+        print(f"Checkpoint saved to {checkpoint_path}")
     return model
 
 # Generate response function (tokenizer-based)
@@ -193,21 +209,24 @@ def main():
     model = TransformerChatbot(tokenizer.vocab_size).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+    # Find latest checkpoint
+    checkpoint_files = glob.glob('models/chatbot_epoch_*.pth')
+    if checkpoint_files:
+        latest_ckpt = max(checkpoint_files, key=os.path.getctime)
+        print(f"Loading checkpoint: {latest_ckpt}")
+        checkpoint = torch.load(latest_ckpt, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0)
+    else:
+        print("No checkpoint found. Starting from scratch.")
+        start_epoch = 0
+
+    epochs = 1  # You can change this or make it configurable
     print("Training model...")
-    model = train(model, dataloader, optimizer, criterion, device)
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'tokenizer': tokenizer.name_or_path
-    }, 'transformer_chatbot.pth')
-    print("Model saved to transformer_chatbot.pth")
-    print("\nTesting the model:")
-    test_inputs = ["What is artificial intelligence?", "Tell me about the moon.", "Who was Albert Einstein?", "Explain quantum mechanics."]
-    for test_input in test_inputs:
-        response = generate_response(model, test_input, tokenizer, device)
-        print(f"Input: {test_input}")
-        print(f"Response: {response}")
-        print()
+    model = train(model, dataloader, optimizer, criterion, device, start_epoch=start_epoch, epochs=start_epoch+epochs)
+    print("Training complete.")
 
 if __name__ == "__main__":
     main() 
