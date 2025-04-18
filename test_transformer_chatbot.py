@@ -76,7 +76,7 @@ def generate_response(model, input_text, tokenizer, device, max_length=20):
 
 def main():
     device = torch.device('cpu')
-    checkpoint = torch.load('transformer_chatbot.pth', map_location=device)
+    checkpoint = torch.load('models/chatbot_epoch_30.pth', map_location=device)
     model = TransformerChatbot(tokenizer.vocab_size)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)

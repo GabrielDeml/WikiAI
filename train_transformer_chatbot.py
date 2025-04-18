@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, IterableDataset
+from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 import random
 import math
@@ -40,7 +42,7 @@ def pairwise_sentences(article):
         yield sentences[i], sentences[i+1]
 
 def gen_tokenized_pairs(max_pairs=5000):
-    wiki = load_dataset("wikipedia", "20220301.en", split="train", streaming=True, trust_remote_code=True)
+    wiki = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True, trust_remote_code=True)
     count = 0
     for article in tqdm(wiki, total=max_pairs//2, desc="Streaming Wikipedia"):
         for inp, resp in pairwise_sentences(article):
@@ -59,14 +61,43 @@ def gen_tokenized_pairs(max_pairs=5000):
                 if count >= max_pairs:
                     return
 
-# Custom Dataset
-class WikiChatDataset(Dataset):
+class WikiChatIterableDataset(IterableDataset):
     def __init__(self, max_pairs=5000):
-        self.data = list(gen_tokenized_pairs(max_pairs))
+        super().__init__()
+        self.max_pairs = max_pairs
+
+    def __iter__(self):
+        """
+        Iterates through the dataset, yielding tokenized input-response pairs.
+        """
+        count = 0
+        wiki = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True, trust_remote_code=True)
+        for article in wiki:
+            for inp, resp in pairwise_sentences(article):
+                if len(inp.split()) > 2 and len(resp.split()) > 2:
+                    input_enc = tokenizer(inp, truncation=True, padding=False, max_length=MAX_LEN, return_tensors="pt")
+                    resp_enc = tokenizer(resp, truncation=True, padding=False, max_length=MAX_LEN, return_tensors="pt")
+                    yield {
+                        "input": input_enc["input_ids"].squeeze(0),
+                        "response_input": torch.cat([
+                            torch.tensor([tokenizer.cls_token_id]),
+                            resp_enc["input_ids"].squeeze(0)[:-1]
+                        ]),
+                        "response_target": resp_enc["input_ids"].squeeze(0)
+                    }
+                    count += 1
+                    if count >= self.max_pairs:
+                        return
+
     def __len__(self):
-        return len(self.data)
-    def __getitem__(self, idx):
-        return self.data[idx]
+        """Returns the number of pairs in the dataset."""
+        return self.max_pairs
+
+def collate_fn(batch):
+    inputs = pad_sequence([item["input"] for item in batch], batch_first=True, padding_value=tokenizer.pad_token_id)
+    resp_inputs = pad_sequence([item["response_input"] for item in batch], batch_first=True, padding_value=tokenizer.pad_token_id)
+    resp_targets = pad_sequence([item["response_target"] for item in batch], batch_first=True, padding_value=tokenizer.pad_token_id)
+    return {"input": inputs, "response_input": resp_inputs, "response_target": resp_targets}
 
 # Positional Encoding
 class PositionalEncoding(nn.Module):
@@ -87,12 +118,13 @@ class PositionalEncoding(nn.Module):
 
 # Transformer Chatbot Model
 class TransformerChatbot(nn.Module):
-    def __init__(self, vocab_size, d_model=64, nhead=4, num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=128):
+    def __init__(self, vocab_size, d_model=64, nhead=4, num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=128, dropout=0.1):
         super(TransformerChatbot, self).__init__()
         
         # Embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.positional_encoding = PositionalEncoding(d_model)
+        self.dropout = nn.Dropout(dropout)
         
         # Transformer
         self.transformer = nn.Transformer(
@@ -101,7 +133,8 @@ class TransformerChatbot(nn.Module):
             num_encoder_layers=num_encoder_layers,
             num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
-            batch_first=True
+            batch_first=True,
+            dropout=dropout
         )
         
         # Output layer
@@ -109,8 +142,8 @@ class TransformerChatbot(nn.Module):
         
     def forward(self, src, tgt, src_mask=None, tgt_mask=None):
         # Embedding and positional encoding
-        src_embedded = self.positional_encoding(self.embedding(src))
-        tgt_embedded = self.positional_encoding(self.embedding(tgt))
+        src_embedded = self.dropout(self.positional_encoding(self.embedding(src)))
+        tgt_embedded = self.dropout(self.positional_encoding(self.embedding(tgt)))
         
         # Create masks for padding tokens
         src_key_padding_mask = (src == tokenizer.pad_token_id)
@@ -139,7 +172,7 @@ class TransformerChatbot(nn.Module):
         return mask
 
 # Training function with mixed precision for MPS
-def train(model, dataloader, optimizer, criterion, device, start_epoch=0, epochs=10):
+def train(model, dataloader, optimizer, criterion, device, scheduler, start_epoch=0, epochs=10):
     model.train()
     for epoch in range(start_epoch, epochs):
         total_loss = 0
@@ -148,7 +181,8 @@ def train(model, dataloader, optimizer, criterion, device, start_epoch=0, epochs
             tgt_input = batch["response_input"].to(device)
             tgt_output = batch["response_target"].to(device)
             optimizer.zero_grad()
-            # Only use autocast for CUDA devices, not for MPS
+            
+            # Only use autocast for CUDA devices
             if device.type == "cuda":
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     output = model(src, tgt_input)
@@ -156,15 +190,19 @@ def train(model, dataloader, optimizer, criterion, device, start_epoch=0, epochs
                     tgt_output_flat = tgt_output.contiguous().view(-1)
                     loss = criterion(output_flat, tgt_output_flat)
             else:
+                # Normal forward pass for CPU and MPS
                 output = model(src, tgt_input)
                 output_flat = output.contiguous().view(-1, output.size(-1))
                 tgt_output_flat = tgt_output.contiguous().view(-1)
                 loss = criterion(output_flat, tgt_output_flat)
+                
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
         print(f"Epoch {epoch + 1}, Loss: {total_loss / len(dataloader):.4f}")
         # Save checkpoint after each epoch
+        os.makedirs("models", exist_ok=True)  # Create models directory if it doesn't exist
         checkpoint_path = f"models/chatbot_epoch_{epoch+1}.pth"
         torch.save({
             'epoch': epoch + 1,
@@ -179,10 +217,11 @@ def train(model, dataloader, optimizer, criterion, device, start_epoch=0, epochs
             'tokenizer': tokenizer.name_or_path
         }, 'transformer_chatbot.pth')
         print(f"Checkpoint saved to {checkpoint_path}")
+        scheduler.step()
     return model
 
 # Generate response function (tokenizer-based)
-def generate_response(model, input_text, tokenizer, device, max_length=20):
+def generate_response(model, input_text, tokenizer, device, max_length=20, temperature=1.0, top_k=50):
     model.eval()
     input_enc = tokenizer(input_text, truncation=True, padding="max_length", max_length=max_length, return_tensors="pt")
     input_tensor = input_enc["input_ids"].to(device)
@@ -192,7 +231,13 @@ def generate_response(model, input_text, tokenizer, device, max_length=20):
         with torch.no_grad():
             output = model(input_tensor, decoder_input)
         next_token_logits = output[:, -1, :]
-        next_token_id = next_token_logits.argmax(-1).item()
+        logits = next_token_logits / temperature
+        # Top-k filtering
+        topk_vals, topk_indices = torch.topk(logits, top_k)
+        filter_mask = logits < topk_vals.min()
+        logits[filter_mask] = -float('Inf')
+        probs = F.softmax(logits, dim=-1)
+        next_token_id = torch.multinomial(probs, 1).item()
         if next_token_id == tokenizer.sep_token_id or next_token_id == tokenizer.pad_token_id:
             break
         output_ids.append(next_token_id)
@@ -204,12 +249,16 @@ def main():
     batch_size = 4
     lr = 0.001
     max_pairs = int(os.environ.get("WIKI_PAIRS", 5000))
-    dataset = WikiChatDataset(max_pairs)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataset = WikiChatIterableDataset(max_pairs)
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=2, shuffle=False)
     model = TransformerChatbot(tokenizer.vocab_size).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
+    # Create models directory if it doesn't exist
+    os.makedirs("models", exist_ok=True)
+    
     # Find latest checkpoint
     checkpoint_files = glob.glob('models/chatbot_epoch_*.pth')
     if checkpoint_files:
@@ -223,10 +272,10 @@ def main():
         print("No checkpoint found. Starting from scratch.")
         start_epoch = 0
 
-    epochs = 1  # You can change this or make it configurable
+    epochs = 30  # You can change this or make it configurable
     print("Training model...")
-    model = train(model, dataloader, optimizer, criterion, device, start_epoch=start_epoch, epochs=start_epoch+epochs)
+    model = train(model, dataloader, optimizer, criterion, device, scheduler, start_epoch=start_epoch, epochs=start_epoch+epochs)
     print("Training complete.")
 
 if __name__ == "__main__":
-    main() 
+    main()
