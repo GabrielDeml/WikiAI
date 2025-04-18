@@ -19,7 +19,7 @@ torch.manual_seed(seed)
 random.seed(seed)
 np.random.seed(seed)
 
-# Device selection: MPS (Apple Silicon GPU) > CUDA > CPU
+# Device selection: Prefer MPS (Apple Silicon GPU), then CUDA, then CPU
 if torch.backends.mps.is_available():
     device = torch.device("mps")
 elif torch.cuda.is_available():
@@ -28,13 +28,19 @@ else:
     device = torch.device("cpu")
 print(f"Using device: {device}")
 
-# Tokenizer
-TOKENIZER_NAME = "bert-base-uncased"
+# Tokenizer setup
+TOKENIZER_NAME = "bert-base-uncased"  # Pretrained BERT tokenizer
+# Load the tokenizer from HuggingFace
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-MAX_LEN = 20
+MAX_LEN = 20  # Maximum sequence length for input/output
 
-# Wikipedia streaming and tokenization
+# --- Wikipedia streaming and tokenization utilities ---
+
 def pairwise_sentences(article):
+    """
+    Splits the article text into sentences and yields consecutive sentence pairs.
+    Used to create (input, response) pairs for chatbot training.
+    """
     import re
     sentence_splitter = re.compile(r'(?<=[.!?]) +')
     sentences = sentence_splitter.split(article["text"].replace("\n", " "))
@@ -42,6 +48,10 @@ def pairwise_sentences(article):
         yield sentences[i], sentences[i+1]
 
 def gen_tokenized_pairs(max_pairs=5000):
+    """
+    Streams Wikipedia articles and yields tokenized (input, response) pairs up to max_pairs.
+    Each pair is tokenized and padded to MAX_LEN.
+    """
     wiki = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True, trust_remote_code=True)
     count = 0
     for article in tqdm(wiki, total=max_pairs//2, desc="Streaming Wikipedia"):
@@ -51,10 +61,12 @@ def gen_tokenized_pairs(max_pairs=5000):
                 resp_enc = tokenizer(resp, truncation=True, padding="max_length", max_length=MAX_LEN, return_tensors="pt")
                 yield {
                     "input": input_enc["input_ids"].squeeze(0),
+                    # Decoder input starts with [CLS] and is shifted right
                     "response_input": torch.cat([
                         torch.tensor([tokenizer.cls_token_id]),
                         resp_enc["input_ids"].squeeze(0)[:-1]
                     ]),
+                    # Decoder target is the actual response
                     "response_target": resp_enc["input_ids"].squeeze(0)
                 }
                 count += 1
@@ -62,6 +74,9 @@ def gen_tokenized_pairs(max_pairs=5000):
                     return
 
 class WikiChatIterableDataset(IterableDataset):
+    """
+    Iterable PyTorch dataset that streams Wikipedia and yields tokenized (input, response) pairs.
+    """
     def __init__(self, max_pairs=5000):
         super().__init__()
         self.max_pairs = max_pairs
@@ -79,10 +94,12 @@ class WikiChatIterableDataset(IterableDataset):
                     resp_enc = tokenizer(resp, truncation=True, padding=False, max_length=MAX_LEN, return_tensors="pt")
                     yield {
                         "input": input_enc["input_ids"].squeeze(0),
+                        # Decoder input starts with [CLS] and is shifted right
                         "response_input": torch.cat([
                             torch.tensor([tokenizer.cls_token_id]),
                             resp_enc["input_ids"].squeeze(0)[:-1]
                         ]),
+                        # Decoder target is the actual response
                         "response_target": resp_enc["input_ids"].squeeze(0)
                     }
                     count += 1
@@ -94,13 +111,20 @@ class WikiChatIterableDataset(IterableDataset):
         return self.max_pairs
 
 def collate_fn(batch):
+    """
+    Pads a batch of samples to the same length for input, response_input, and response_target.
+    Returns a dictionary of padded tensors.
+    """
     inputs = pad_sequence([item["input"] for item in batch], batch_first=True, padding_value=tokenizer.pad_token_id)
     resp_inputs = pad_sequence([item["response_input"] for item in batch], batch_first=True, padding_value=tokenizer.pad_token_id)
     resp_targets = pad_sequence([item["response_target"] for item in batch], batch_first=True, padding_value=tokenizer.pad_token_id)
     return {"input": inputs, "response_input": resp_inputs, "response_target": resp_targets}
 
-# Positional Encoding
+# --- Positional Encoding for Transformer ---
 class PositionalEncoding(nn.Module):
+    """
+    Implements sinusoidal positional encoding for transformer models.
+    """
     def __init__(self, d_model, max_seq_length=100):
         super(PositionalEncoding, self).__init__()
         
@@ -111,22 +135,27 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         
-        self.register_buffer('pe', pe.unsqueeze(0))
+        self.register_buffer('pe', pe.unsqueeze(0))  # Register as buffer so it's saved with the model
         
     def forward(self, x):
+        # Add positional encoding to input tensor x
         return x + self.pe[:, :x.size(1)]
 
-# Transformer Chatbot Model
+# --- Transformer Chatbot Model ---
 class TransformerChatbot(nn.Module):
+    """
+    Sequence-to-sequence transformer model for chatbot response generation.
+    """
     def __init__(self, vocab_size, d_model=64, nhead=4, num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=128, dropout=0.1):
         super(TransformerChatbot, self).__init__()
         
-        # Embeddings
+        # Embedding layer for tokens
         self.embedding = nn.Embedding(vocab_size, d_model)
+        # Positional encoding
         self.positional_encoding = PositionalEncoding(d_model)
         self.dropout = nn.Dropout(dropout)
         
-        # Transformer
+        # Transformer encoder-decoder
         self.transformer = nn.Transformer(
             d_model=d_model,
             nhead=nhead,
@@ -137,10 +166,16 @@ class TransformerChatbot(nn.Module):
             dropout=dropout
         )
         
-        # Output layer
+        # Output projection to vocabulary size
         self.output_layer = nn.Linear(d_model, vocab_size)
         
     def forward(self, src, tgt, src_mask=None, tgt_mask=None):
+        """
+        Forward pass for the transformer chatbot.
+        src: input tensor (batch, seq_len)
+        tgt: decoder input tensor (batch, seq_len)
+        Returns logits for each token in the output sequence.
+        """
         # Embedding and positional encoding
         src_embedded = self.dropout(self.positional_encoding(self.embedding(src)))
         tgt_embedded = self.dropout(self.positional_encoding(self.embedding(tgt)))
@@ -149,11 +184,11 @@ class TransformerChatbot(nn.Module):
         src_key_padding_mask = (src == tokenizer.pad_token_id)
         tgt_key_padding_mask = (tgt == tokenizer.pad_token_id)
         
-        # Generate subsequent mask for target
+        # Generate subsequent mask for target (prevents attending to future tokens)
         tgt_len = tgt.size(1)
         subsequent_mask = self.generate_square_subsequent_mask(tgt_len).to(tgt.device)
         
-        # Transformer forward
+        # Transformer forward pass
         output = self.transformer(
             src_embedded, 
             tgt_embedded, 
@@ -163,16 +198,23 @@ class TransformerChatbot(nn.Module):
             tgt_key_padding_mask=tgt_key_padding_mask
         )
         
-        # Pass through output layer
+        # Project to vocabulary logits
         return self.output_layer(output)
     
     def generate_square_subsequent_mask(self, sz):
+        """
+        Generates a square mask for the sequence. Used in the decoder to mask future positions.
+        """
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-# Training function with mixed precision for MPS
+# --- Training function with mixed precision for MPS ---
 def train(model, dataloader, optimizer, criterion, device, scheduler, start_epoch=0, epochs=10):
+    """
+    Trains the transformer chatbot model.
+    Supports mixed precision on CUDA, and saves checkpoints after each epoch.
+    """
     model.train()
     for epoch in range(start_epoch, epochs):
         total_loss = 0
@@ -182,7 +224,7 @@ def train(model, dataloader, optimizer, criterion, device, scheduler, start_epoc
             tgt_output = batch["response_target"].to(device)
             optimizer.zero_grad()
             
-            # Only use autocast for CUDA devices
+            # Only use autocast for CUDA devices (mixed precision)
             if device.type == "cuda":
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     output = model(src, tgt_input)
@@ -197,7 +239,7 @@ def train(model, dataloader, optimizer, criterion, device, scheduler, start_epoc
                 loss = criterion(output_flat, tgt_output_flat)
                 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
             optimizer.step()
             total_loss += loss.item()
         print(f"Epoch {epoch + 1}, Loss: {total_loss / len(dataloader):.4f}")
@@ -220,8 +262,12 @@ def train(model, dataloader, optimizer, criterion, device, scheduler, start_epoc
         scheduler.step()
     return model
 
-# Generate response function (tokenizer-based)
+# --- Generate response function (tokenizer-based) ---
 def generate_response(model, input_text, tokenizer, device, max_length=20, temperature=1.0, top_k=50):
+    """
+    Generates a response from the model given an input text string.
+    Uses top-k sampling and temperature for diversity.
+    """
     model.eval()
     input_enc = tokenizer(input_text, truncation=True, padding="max_length", max_length=max_length, return_tensors="pt")
     input_tensor = input_enc["input_ids"].to(device)
@@ -244,8 +290,12 @@ def generate_response(model, input_text, tokenizer, device, max_length=20, tempe
         decoder_input = torch.cat([decoder_input, torch.tensor([[next_token_id]], dtype=torch.long).to(device)], dim=1)
     return tokenizer.decode(output_ids, skip_special_tokens=True)
 
-# Main training procedure
+# --- Main training procedure ---
 def main():
+    """
+    Main function to set up data, model, optimizer, and start training.
+    Handles checkpoint loading and saving.
+    """
     batch_size = 4
     lr = 0.001
     max_pairs = int(os.environ.get("WIKI_PAIRS", 5000))
