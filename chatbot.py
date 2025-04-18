@@ -1,5 +1,3 @@
-import os
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,7 +19,6 @@ def get_device():
     else:
         return torch.device("cpu")
 
-# Positional Encoding
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_seq_length=100):
         super(PositionalEncoding, self).__init__()
@@ -34,7 +31,6 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
 
-# Transformer Chatbot Model (with dropout for compatibility)
 class TransformerChatbot(nn.Module):
     def __init__(self, vocab_size, d_model=64, nhead=4, num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=128, dropout=0.1):
         super(TransformerChatbot, self).__init__()
@@ -114,18 +110,14 @@ def main():
     model = TransformerChatbot(tokenizer.vocab_size)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
-    test_inputs = [
-        "What is artificial intelligence?",
-        "Tell me about the moon.",
-        "Who was Albert Einstein?",
-        "Explain quantum mechanics."
-    ]
-    print("\nTesting the model:")
-    for test_input in test_inputs:
-        response = generate_response(model, test_input, tokenizer, device, temperature=1.0, top_k=50)
-        print(f"Input: {test_input}")
-        print(f"Response: {response}")
-        print()
+    print("\nWelcome to the Transformer Chatbot! Type 'quit' or 'exit' to stop.\n")
+    while True:
+        user_input = input("You: ").strip()
+        if user_input.lower() in {"quit", "exit"}:
+            print("Goodbye!")
+            break
+        response = generate_response(model, user_input, tokenizer, device, temperature=1.0, top_k=50)
+        print(f"Bot: {response}")
 
 if __name__ == "__main__":
     main() 
