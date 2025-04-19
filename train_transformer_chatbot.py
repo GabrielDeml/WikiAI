@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, IterableDataset
+from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 import random
@@ -12,6 +14,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoTokenizer
 import glob
+from torch.cuda.amp import autocast, GradScaler
 
 # Set random seed for reproducibility
 seed = 42
@@ -27,6 +30,8 @@ elif torch.cuda.is_available():
 else:
     device = torch.device("cpu")
 print(f"Using device: {device}")
+if device.type == "cuda":
+    torch.backends.cudnn.benchmark = True
 
 # Tokenizer setup
 TOKENIZER_NAME = "bert-base-uncased"  # Pretrained BERT tokenizer
@@ -52,7 +57,7 @@ def gen_tokenized_pairs(max_pairs=5000):
     Streams Wikipedia articles and yields tokenized (input, response) pairs up to max_pairs.
     Each pair is tokenized and padded to MAX_LEN.
     """
-    wiki = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True, trust_remote_code=True)
+    wiki = load_dataset("bigcode/the-stack", "20231101.en", split="train", streaming=True, trust_remote_code=True)
     count = 0
     for article in tqdm(wiki, total=max_pairs//2, desc="Streaming Wikipedia"):
         for inp, resp in pairwise_sentences(article):
@@ -146,7 +151,7 @@ class TransformerChatbot(nn.Module):
     """
     Sequence-to-sequence transformer model for chatbot response generation.
     """
-    def __init__(self, vocab_size, d_model=64, nhead=4, num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=128, dropout=0.1):
+    def __init__(self, vocab_size, d_model=512, nhead=8, num_encoder_layers=8, num_decoder_layers=8, dim_feedforward=8192, dropout=0.1):
         super(TransformerChatbot, self).__init__()
         
         # Embedding layer for tokens
@@ -216,31 +221,28 @@ def train(model, dataloader, optimizer, criterion, device, scheduler, start_epoc
     Supports mixed precision on CUDA, and saves checkpoints after each epoch.
     """
     model.train()
+    scaler = GradScaler()
     for epoch in range(start_epoch, epochs):
         total_loss = 0
         for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}"):
             src = batch["input"].to(device)
             tgt_input = batch["response_input"].to(device)
             tgt_output = batch["response_target"].to(device)
+
             optimizer.zero_grad()
-            
-            # Only use autocast for CUDA devices (mixed precision)
-            if device.type == "cuda":
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    output = model(src, tgt_input)
-                    output_flat = output.contiguous().view(-1, output.size(-1))
-                    tgt_output_flat = tgt_output.contiguous().view(-1)
-                    loss = criterion(output_flat, tgt_output_flat)
-            else:
-                # Normal forward pass for CPU and MPS
+
+            with autocast(enabled=(device.type=="cuda")):
                 output = model(src, tgt_input)
-                output_flat = output.contiguous().view(-1, output.size(-1))
-                tgt_output_flat = tgt_output.contiguous().view(-1)
+                output_flat = output.view(-1, output.size(-1))
+                tgt_output_flat = tgt_output.view(-1)
                 loss = criterion(output_flat, tgt_output_flat)
-                
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
-            optimizer.step()
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
             total_loss += loss.item()
         print(f"Epoch {epoch + 1}, Loss: {total_loss / len(dataloader):.4f}")
         # Save checkpoint after each epoch
@@ -299,30 +301,41 @@ def main():
     batch_size = 4
     lr = 0.001
     max_pairs = int(os.environ.get("WIKI_PAIRS", 5000))
+    epochs = 30  # You can change this or make it configurable
     dataset = WikiChatIterableDataset(max_pairs)
-    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=2, shuffle=False)
-    model = TransformerChatbot(tokenizer.vocab_size).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-
-    # Create models directory if it doesn't exist
-    os.makedirs("models", exist_ok=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
+        shuffle=False
+    )
     
+    start_epoch = 0
     # Find latest checkpoint
     checkpoint_files = glob.glob('models/chatbot_epoch_*.pth')
     if checkpoint_files:
         latest_ckpt = max(checkpoint_files, key=os.path.getctime)
         print(f"Loading checkpoint: {latest_ckpt}")
         checkpoint = torch.load(latest_ckpt, map_location=device)
+        model = TransformerChatbot(tokenizer.vocab_size).to(device)
         model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint.get('epoch', 0)
     else:
         print("No checkpoint found. Starting from scratch.")
-        start_epoch = 0
+        model = TransformerChatbot(tokenizer.vocab_size).to(device)
 
-    epochs = 30  # You can change this or make it configurable
+    total_steps = (start_epoch + epochs) * len(dataloader)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id, label_smoothing=0.1)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=total_steps // 10,
+        num_training_steps=total_steps
+    )
+
     print("Training model...")
     model = train(model, dataloader, optimizer, criterion, device, scheduler, start_epoch=start_epoch, epochs=start_epoch+epochs)
     print("Training complete.")
