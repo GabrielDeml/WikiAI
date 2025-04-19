@@ -215,90 +215,75 @@ class TransformerChatbot(nn.Module):
         return mask
 
 # --- Training function with mixed precision for MPS ---
-def train(model, train_loader, val_loader, optimizer, criterion, device, scheduler, start_epoch=0, epochs=10):
+def train(model, train_loader, val_loader, optimizer, criterion, device, scheduler, total_steps):
     """
-    Trains the transformer chatbot model.
-    Supports mixed precision on CUDA, and saves checkpoints after each epoch.
+    Trains the transformer chatbot model for a fixed number of steps.
+    Runs validation and checkpointing every CHECKPOINT_STEPS iterations.
     """
     best_val_loss = float('inf')
-    model.train()
+    checkpoint_interval = int(os.environ.get("CHECKPOINT_STEPS", 1000))
+    iteration = 0
     scaler = GradScaler()
+    from itertools import islice
     from math import ceil
-    for epoch in range(start_epoch, epochs):
-        total_loss = 0
-        steps_per_epoch = ceil(train_loader.dataset.max_pairs / train_loader.batch_size)
-        pbar = tqdm(total=steps_per_epoch, desc=f"Epoch {epoch+1}")
-        for batch in train_loader:
-            src = batch["input"].to(device)
-            tgt_input = batch["response_input"].to(device)
-            tgt_output = batch["response_target"].to(device)
 
-            optimizer.zero_grad()
+    pbar = tqdm(total=total_steps, desc="Training")
+    model.train()
+    cumulative_loss = 0.0
+    for batch in islice(train_loader, total_steps):
+        src = batch["input"].to(device)
+        tgt_input = batch["response_input"].to(device)
+        tgt_output = batch["response_target"].to(device)
 
-            with autocast(enabled=(device.type=="cuda")):
-                output = model(src, tgt_input)
-                output_flat = output.view(-1, output.size(-1))
-                tgt_output_flat = tgt_output.view(-1)
-                loss = criterion(output_flat, tgt_output_flat)
+        optimizer.zero_grad()
+        with autocast(enabled=(device.type=="cuda")):
+            output = model(src, tgt_input)
+            output_flat = output.view(-1, output.size(-1))
+            tgt_output_flat = tgt_output.view(-1)
+            loss = criterion(output_flat, tgt_output_flat)
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
 
-            total_loss += loss.item()
-            pbar.update(1)
-        pbar.close()
-        print(f"Epoch {epoch + 1}, Loss: {total_loss / steps_per_epoch:.4f}")
+        iteration += 1
+        cumulative_loss += loss.item()
+        avg_loss = cumulative_loss / iteration
+        pbar.update(1)
+        pbar.set_postfix(loss=f"{avg_loss:.4f}")
 
-        # Validation loop
-        val_loss = 0
-        val_steps = ceil(val_loader.dataset.max_pairs / val_loader.batch_size)
-        val_pbar = tqdm(total=val_steps, desc="Validation")
-        model.eval()
-        with torch.no_grad():
-            for batch in val_loader:
-                src = batch["input"].to(device)
-                tgt_input = batch["response_input"].to(device)
-                tgt_output = batch["response_target"].to(device)
-                output = model(src, tgt_input)
-                loss = criterion(output.view(-1, output.size(-1)), tgt_output.view(-1))
-                val_loss += loss.item()
-                val_pbar.update(1)
-        val_pbar.close()
-        avg_val = val_loss / val_steps
-        print(f"Validation Loss: {avg_val:.4f}")
-        # Save best model
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
+        if iteration % checkpoint_interval == 0:
+            # Validation
+            val_loss = 0.0
+            val_steps = ceil(val_loader.dataset.max_pairs / val_loader.batch_size)
+            val_pbar = tqdm(total=val_steps, desc="Validation")
+            model.eval()
+            with torch.no_grad():
+                for vbatch in islice(val_loader, val_steps):
+                    vsrc = vbatch["input"].to(device)
+                    vtgt_in = vbatch["response_input"].to(device)
+                    vtgt_out = vbatch["response_target"].to(device)
+                    vout = model(vsrc, vtgt_in)
+                    vloss = criterion(vout.view(-1, vout.size(-1)), vtgt_out.view(-1))
+                    val_loss += vloss.item()
+                    val_pbar.update(1)
+            val_pbar.close()
+            avg_val = val_loss / val_steps
+            print(f"\nIter {iteration}: Validation Loss: {avg_val:.4f}")
+            ckpt_path = f"models/iter_{iteration}.pth"
             os.makedirs("models", exist_ok=True)
-            best_path = f"models/best_chatbot_epoch_{epoch+1}.pth"
             torch.save({
-                'epoch': epoch + 1,
+                'iteration': iteration,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'tokenizer': tokenizer.name_or_path
-            }, best_path)
-            print(f"Best model saved to {best_path}")
-        model.train()
-        # Save checkpoint after each epoch
-        os.makedirs("models", exist_ok=True)  # Create models directory if it doesn't exist
-        checkpoint_path = f"models/chatbot_epoch_{epoch+1}.pth"
-        torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'tokenizer': tokenizer.name_or_path
-        }, checkpoint_path)
-        # Also save latest checkpoint for test script compatibility
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'tokenizer': tokenizer.name_or_path
-        }, 'transformer_chatbot.pth')
-        print(f"Checkpoint saved to {checkpoint_path}")
-        scheduler.step()
+            }, ckpt_path)
+            print(f"Checkpoint saved to {ckpt_path}")
+            model.train()
+    pbar.close()
     return model
 
 # --- Generate response function (tokenizer-based) ---
@@ -338,7 +323,6 @@ def main():
     batch_size = 4
     lr = 0.001
     max_pairs = int(os.environ.get("WIKI_PAIRS", 5000))
-    epochs = 30  # You can change this or make it configurable
     dataset = WikiChatIterableDataset(max_pairs)
     dataloader = DataLoader(
         dataset,
@@ -363,7 +347,6 @@ def main():
         shuffle=False
     )
 
-    start_epoch = 0
     # Find latest checkpoint
     checkpoint_files = glob.glob('models/chatbot_epoch_*.pth')
     if checkpoint_files:
@@ -372,22 +355,21 @@ def main():
         checkpoint = torch.load(latest_ckpt, map_location=device)
         model = TransformerChatbot(tokenizer.vocab_size).to(device)
         model.load_state_dict(checkpoint['model_state_dict'])
-        start_epoch = checkpoint.get('epoch', 0)
     else:
         print("No checkpoint found. Starting from scratch.")
         model = TransformerChatbot(tokenizer.vocab_size).to(device)
 
-    total_steps = (start_epoch + epochs) * len(dataloader)
+    # Total training steps
+    total_steps = int(os.environ.get("TRAIN_STEPS", 100000))
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id, label_smoothing=0.1)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=total_steps // 10,
         num_training_steps=total_steps
     )
-
-    print("Training model...")
-    model = train(model, dataloader, val_dataloader, optimizer, criterion, device, scheduler, start_epoch=start_epoch, epochs=start_epoch+epochs)
+    print(f"Training for {total_steps} steps with checkpoints every {os.environ.get('CHECKPOINT_STEPS', 1000)} iterations...")
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id, label_smoothing=0.1)
+    model = train(model, dataloader, val_dataloader, optimizer, criterion, device, scheduler, total_steps)
     print("Training complete.")
 
 if __name__ == "__main__":
