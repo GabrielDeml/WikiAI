@@ -14,7 +14,7 @@ from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoTokenizer
 import glob
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # Set random seed for reproducibility
 seed = 42
@@ -34,7 +34,7 @@ if device.type == "cuda":
     torch.backends.cudnn.benchmark = True
 
 # Tokenizer setup
-TOKENIZER_NAME = "bert-base-uncased"  # Pretrained BERT tokenizer
+TOKENIZER_NAME = "microsoft/codebert-base"  # Code-aware tokenizer
 # Load the tokenizer from HuggingFace
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 MAX_LEN = 20  # Maximum sequence length for input/output
@@ -43,23 +43,32 @@ MAX_LEN = 20  # Maximum sequence length for input/output
 
 def pairwise_sentences(article):
     """
-    Splits the article text into sentences and yields consecutive sentence pairs.
+    Splits code content into consecutive line pairs.
     Used to create (input, response) pairs for chatbot training.
     """
-    import re
-    sentence_splitter = re.compile(r'(?<=[.!?]) +')
-    sentences = sentence_splitter.split(article["text"].replace("\n", " "))
-    for i in range(len(sentences) - 1):
-        yield sentences[i], sentences[i+1]
+    raw = article.get("content", "")
+    if not raw:
+        return
+    # Discard very large files to avoid long streams
+    if len(raw) > 200_000:  # skip files over ~200k chars
+        return
+    # Split on non-empty lines
+    lines = [line for line in raw.split("\n") if line.strip()]
+    # Yield consecutive line pairs
+    for i in range(len(lines) - 1):
+        yield lines[i], lines[i + 1]
 
 def gen_tokenized_pairs(max_pairs=5000):
     """
     Streams Wikipedia articles and yields tokenized (input, response) pairs up to max_pairs.
     Each pair is tokenized and padded to MAX_LEN.
     """
-    wiki = load_dataset("bigcode/the-stack", "20231101.en", split="train", streaming=True, trust_remote_code=True)
+    wiki = load_dataset("bigcode/the-stack", split="train", streaming=True, trust_remote_code=True)
     count = 0
     for article in tqdm(wiki, total=max_pairs//2, desc="Streaming Wikipedia"):
+        raw = article.get("content", "")
+        if not raw or len(raw) > 200_000:
+            continue
         for inp, resp in pairwise_sentences(article):
             if len(inp.split()) > 2 and len(resp.split()) > 2:
                 input_enc = tokenizer(inp, truncation=True, padding="max_length", max_length=MAX_LEN, return_tensors="pt")
@@ -91,8 +100,11 @@ class WikiChatIterableDataset(IterableDataset):
         Iterates through the dataset, yielding tokenized input-response pairs.
         """
         count = 0
-        wiki = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True, trust_remote_code=True)
+        wiki = load_dataset("bigcode/the-stack", split="train", streaming=True, trust_remote_code=True)
         for article in wiki:
+            raw = article.get("content", "")
+            if not raw or len(raw) > 200_000:
+                continue
             for inp, resp in pairwise_sentences(article):
                 if len(inp.split()) > 2 and len(resp.split()) > 2:
                     input_enc = tokenizer(inp, truncation=True, padding=False, max_length=MAX_LEN, return_tensors="pt")
@@ -193,6 +205,10 @@ class TransformerChatbot(nn.Module):
         tgt_len = tgt.size(1)
         subsequent_mask = self.generate_square_subsequent_mask(tgt_len).to(tgt.device)
         
+        # Ensure mask type matches key_padding_mask type (bool)
+        if subsequent_mask.dtype != torch.bool:
+            subsequent_mask = subsequent_mask == 0
+        
         # Transformer forward pass
         output = self.transformer(
             src_embedded, 
@@ -223,7 +239,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, device, schedul
     best_val_loss = float('inf')
     checkpoint_interval = int(os.environ.get("CHECKPOINT_STEPS", 1000))
     iteration = 0
-    scaler = GradScaler()
+    scaler = GradScaler(device if device.type == "cuda" else None)
     from itertools import islice
     from math import ceil
 
@@ -236,7 +252,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, device, schedul
         tgt_output = batch["response_target"].to(device)
 
         optimizer.zero_grad()
-        with autocast(enabled=(device.type=="cuda")):
+        with autocast(device_type=device.type if device.type in ("cuda", "cpu", "mps") else "cpu"):
             output = model(src, tgt_input)
             output_flat = output.view(-1, output.size(-1))
             tgt_output_flat = tgt_output.view(-1)
