@@ -284,17 +284,26 @@ def train(model, train_loader, val_loader, optimizer, criterion, device, schedul
             val_steps = ceil(val_loader.dataset.max_pairs / val_loader.batch_size)
             val_pbar = tqdm(total=val_steps, desc="Validation")
             model.eval()
+            val_batches = 0
             with torch.no_grad():
                 for vbatch in islice(cycle(val_loader), val_steps):
                     vsrc = vbatch["input"].to(device)
                     vtgt_in = vbatch["response_input"].to(device)
                     vtgt_out = vbatch["response_target"].to(device)
+                    # Skip batch if all targets are padding
+                    if (vtgt_out != tokenizer.pad_token_id).sum() == 0:
+                        continue
                     vout = model(vsrc, vtgt_in)
                     vloss = criterion(vout.view(-1, vout.size(-1)), vtgt_out.view(-1))
+                    # Skip batch if loss is nan or inf
+                    if torch.isnan(vloss) or torch.isinf(vloss):
+                        print("[Validation] NaN or Inf loss detected, skipping batch.")
+                        continue
                     val_loss += vloss.item()
+                    val_batches += 1
                     val_pbar.update(1)
             val_pbar.close()
-            avg_val = val_loss / val_steps
+            avg_val = val_loss / max(val_batches, 1)
             print(f"\nIter {iteration}: Validation Loss: {avg_val:.4f}")
             ckpt_path = f"models/iter_{iteration}.pth"
             os.makedirs("models", exist_ok=True)
@@ -343,15 +352,15 @@ def main():
     Main function to set up data, model, optimizer, and start training.
     Handles checkpoint loading and saving.
     """
-    # Allow batch size override via env, default to 32 for speed
-    batch_size = int(os.environ.get("BATCH_SIZE", 512))
+    # Allow batch size override via env, default to 512 for speed
+    train_batch_size = int(os.environ.get("BATCH_SIZE", 512))
+    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 32))
     lr = 0.001
     max_pairs = int(os.environ.get("WIKI_PAIRS", 5000))
-    dataset = WikiChatIterableDataset(max_pairs)
-    # Use fewer workers if CPU is bottlenecked, or more if underutilized
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
+    train_dataset = WikiChatIterableDataset(max_pairs)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_batch_size,
         collate_fn=collate_fn,
         num_workers=8,
         pin_memory=True,
@@ -359,12 +368,12 @@ def main():
         shuffle=False
     )
 
-    # Validation DataLoader
-    val_max_pairs = int(os.environ.get("VAL_WIKI_PAIRS", 1000))
+    # Validation DataLoader with larger dataset and smaller batch size
+    val_max_pairs = int(os.environ.get("VAL_WIKI_PAIRS", 10000))
     val_dataset = WikiChatIterableDataset(val_max_pairs)
-    val_dataloader = DataLoader(
+    val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=val_batch_size,
         collate_fn=collate_fn,
         num_workers=4,
         pin_memory=True,
@@ -411,7 +420,7 @@ def main():
 
     # Try to auto-tune batch size if OOM
     try:
-        model = train(model, dataloader, val_dataloader, optimizer, criterion, device, scheduler, total_steps)
+        model = train(model, train_loader, val_loader, optimizer, criterion, device, scheduler, total_steps)
     except RuntimeError as e:
         if "out of memory" in str(e):
             print("CUDA OOM: Try reducing BATCH_SIZE env variable.")
