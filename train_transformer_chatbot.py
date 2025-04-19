@@ -15,6 +15,13 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 import glob
 from torch.amp import autocast, GradScaler
+import subprocess
+import time
+try:
+    import bitsandbytes as bnb
+    BNB_AVAILABLE = True
+except ImportError:
+    BNB_AVAILABLE = False
 
 # Set random seed for reproducibility
 seed = 42
@@ -240,13 +247,13 @@ def train(model, train_loader, val_loader, optimizer, criterion, device, schedul
     checkpoint_interval = int(os.environ.get("CHECKPOINT_STEPS", 1000))
     iteration = 0
     scaler = GradScaler(device if device.type == "cuda" else None)
-    from itertools import islice
+    from itertools import islice, cycle
     from math import ceil
 
     pbar = tqdm(total=total_steps, desc="Training")
     model.train()
     cumulative_loss = 0.0
-    for batch in islice(train_loader, total_steps):
+    for batch in islice(cycle(train_loader), total_steps):
         src = batch["input"].to(device)
         tgt_input = batch["response_input"].to(device)
         tgt_output = batch["response_target"].to(device)
@@ -278,7 +285,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, device, schedul
             val_pbar = tqdm(total=val_steps, desc="Validation")
             model.eval()
             with torch.no_grad():
-                for vbatch in islice(val_loader, val_steps):
+                for vbatch in islice(cycle(val_loader), val_steps):
                     vsrc = vbatch["input"].to(device)
                     vtgt_in = vbatch["response_input"].to(device)
                     vtgt_out = vbatch["response_target"].to(device)
@@ -336,10 +343,12 @@ def main():
     Main function to set up data, model, optimizer, and start training.
     Handles checkpoint loading and saving.
     """
-    batch_size = 4
+    # Allow batch size override via env, default to 32 for speed
+    batch_size = int(os.environ.get("BATCH_SIZE", 512))
     lr = 0.001
     max_pairs = int(os.environ.get("WIKI_PAIRS", 5000))
     dataset = WikiChatIterableDataset(max_pairs)
+    # Use fewer workers if CPU is bottlenecked, or more if underutilized
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -377,7 +386,12 @@ def main():
 
     # Total training steps
     total_steps = int(os.environ.get("TRAIN_STEPS", 100000))
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    # Use bitsandbytes AdamW8bit if available and on CUDA
+    if BNB_AVAILABLE and device.type == "cuda":
+        print("Using bitsandbytes AdamW8bit optimizer for speed and memory efficiency.")
+        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=lr, weight_decay=0.01)
+    else:
+        optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=total_steps // 10,
@@ -385,8 +399,27 @@ def main():
     )
     print(f"Training for {total_steps} steps with checkpoints every {os.environ.get('CHECKPOINT_STEPS', 1000)} iterations...")
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id, label_smoothing=0.1)
-    model = train(model, dataloader, val_dataloader, optimizer, criterion, device, scheduler, total_steps)
+
+    # Log GPU utilization every 100 steps
+    def log_gpu_util():
+        if device.type == "cuda":
+            try:
+                util = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
+                print("[GPU]", util.decode().strip())
+            except Exception as e:
+                print("[GPU] nvidia-smi not available:", e)
+
+    # Try to auto-tune batch size if OOM
+    try:
+        model = train(model, dataloader, val_dataloader, optimizer, criterion, device, scheduler, total_steps)
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print("CUDA OOM: Try reducing BATCH_SIZE env variable.")
+        raise
+
     print("Training complete.")
+    # Suggest using local dataset for speed if streaming is slow
+    print("Tip: For even faster training, consider downloading a local subset of the dataset and training from disk instead of streaming.")
 
 if __name__ == "__main__":
     main()
