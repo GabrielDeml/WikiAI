@@ -215,16 +215,20 @@ class TransformerChatbot(nn.Module):
         return mask
 
 # --- Training function with mixed precision for MPS ---
-def train(model, dataloader, optimizer, criterion, device, scheduler, start_epoch=0, epochs=10):
+def train(model, train_loader, val_loader, optimizer, criterion, device, scheduler, start_epoch=0, epochs=10):
     """
     Trains the transformer chatbot model.
     Supports mixed precision on CUDA, and saves checkpoints after each epoch.
     """
+    best_val_loss = float('inf')
     model.train()
     scaler = GradScaler()
+    from math import ceil
     for epoch in range(start_epoch, epochs):
         total_loss = 0
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}"):
+        steps_per_epoch = ceil(train_loader.dataset.max_pairs / train_loader.batch_size)
+        pbar = tqdm(total=steps_per_epoch, desc=f"Epoch {epoch+1}")
+        for batch in train_loader:
             src = batch["input"].to(device)
             tgt_input = batch["response_input"].to(device)
             tgt_output = batch["response_target"].to(device)
@@ -244,7 +248,40 @@ def train(model, dataloader, optimizer, criterion, device, scheduler, start_epoc
             scaler.update()
 
             total_loss += loss.item()
-        print(f"Epoch {epoch + 1}, Loss: {total_loss / len(dataloader):.4f}")
+            pbar.update(1)
+        pbar.close()
+        print(f"Epoch {epoch + 1}, Loss: {total_loss / steps_per_epoch:.4f}")
+
+        # Validation loop
+        val_loss = 0
+        val_steps = ceil(val_loader.dataset.max_pairs / val_loader.batch_size)
+        val_pbar = tqdm(total=val_steps, desc="Validation")
+        model.eval()
+        with torch.no_grad():
+            for batch in val_loader:
+                src = batch["input"].to(device)
+                tgt_input = batch["response_input"].to(device)
+                tgt_output = batch["response_target"].to(device)
+                output = model(src, tgt_input)
+                loss = criterion(output.view(-1, output.size(-1)), tgt_output.view(-1))
+                val_loss += loss.item()
+                val_pbar.update(1)
+        val_pbar.close()
+        avg_val = val_loss / val_steps
+        print(f"Validation Loss: {avg_val:.4f}")
+        # Save best model
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            os.makedirs("models", exist_ok=True)
+            best_path = f"models/best_chatbot_epoch_{epoch+1}.pth"
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'tokenizer': tokenizer.name_or_path
+            }, best_path)
+            print(f"Best model saved to {best_path}")
+        model.train()
         # Save checkpoint after each epoch
         os.makedirs("models", exist_ok=True)  # Create models directory if it doesn't exist
         checkpoint_path = f"models/chatbot_epoch_{epoch+1}.pth"
@@ -312,7 +349,20 @@ def main():
         persistent_workers=True,
         shuffle=False
     )
-    
+
+    # Validation DataLoader
+    val_max_pairs = int(os.environ.get("VAL_WIKI_PAIRS", 1000))
+    val_dataset = WikiChatIterableDataset(val_max_pairs)
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        shuffle=False
+    )
+
     start_epoch = 0
     # Find latest checkpoint
     checkpoint_files = glob.glob('models/chatbot_epoch_*.pth')
@@ -337,7 +387,7 @@ def main():
     )
 
     print("Training model...")
-    model = train(model, dataloader, optimizer, criterion, device, scheduler, start_epoch=start_epoch, epochs=start_epoch+epochs)
+    model = train(model, dataloader, val_dataloader, optimizer, criterion, device, scheduler, start_epoch=start_epoch, epochs=start_epoch+epochs)
     print("Training complete.")
 
 if __name__ == "__main__":
