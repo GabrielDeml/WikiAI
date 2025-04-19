@@ -11,6 +11,7 @@ import os
 from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoTokenizer
+from transformers import AdamW, get_linear_schedule_with_warmup
 import glob
 
 # Set random seed for reproducibility
@@ -32,7 +33,7 @@ print(f"Using device: {device}")
 TOKENIZER_NAME = "bert-base-uncased"  # Pretrained BERT tokenizer
 # Load the tokenizer from HuggingFace
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-MAX_LEN = 20  # Maximum sequence length for input/output
+MAX_LEN = 128  # Maximum sequence length for input/output
 
 # --- Wikipedia streaming and tokenization utilities ---
 
@@ -47,7 +48,7 @@ def pairwise_sentences(article):
     for i in range(len(sentences) - 1):
         yield sentences[i], sentences[i+1]
 
-def gen_tokenized_pairs(max_pairs=5000):
+def gen_tokenized_pairs(max_pairs=100000):
     """
     Streams Wikipedia articles and yields tokenized (input, response) pairs up to max_pairs.
     Each pair is tokenized and padded to MAX_LEN.
@@ -77,7 +78,7 @@ class WikiChatIterableDataset(IterableDataset):
     """
     Iterable PyTorch dataset that streams Wikipedia and yields tokenized (input, response) pairs.
     """
-    def __init__(self, max_pairs=5000):
+    def __init__(self, max_pairs=100000):
         super().__init__()
         self.max_pairs = max_pairs
 
@@ -146,7 +147,7 @@ class TransformerChatbot(nn.Module):
     """
     Sequence-to-sequence transformer model for chatbot response generation.
     """
-    def __init__(self, vocab_size, d_model=64, nhead=4, num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=128, dropout=0.1):
+    def __init__(self, vocab_size, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=2048, dropout=0.1):
         super(TransformerChatbot, self).__init__()
         
         # Embedding layer for tokens
@@ -296,15 +297,17 @@ def main():
     Main function to set up data, model, optimizer, and start training.
     Handles checkpoint loading and saving.
     """
-    batch_size = 4
-    lr = 0.001
-    max_pairs = int(os.environ.get("WIKI_PAIRS", 5000))
+    batch_size = 16
+    lr = 5e-5
+    max_pairs = int(os.environ.get("WIKI_PAIRS", 100000))
     dataset = WikiChatIterableDataset(max_pairs)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=2, shuffle=False)
     model = TransformerChatbot(tokenizer.vocab_size).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+
+    # Linear warmup schedule: 10% warmup, then linear decay
+    total_steps = len(dataloader) * 50
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1 * total_steps), num_training_steps=total_steps)
 
     # Create models directory if it doesn't exist
     os.makedirs("models", exist_ok=True)
@@ -322,7 +325,7 @@ def main():
         print("No checkpoint found. Starting from scratch.")
         start_epoch = 0
 
-    epochs = 30  # You can change this or make it configurable
+    epochs = 50  # You can change this or make it configurable
     print("Training model...")
     model = train(model, dataloader, optimizer, criterion, device, scheduler, start_epoch=start_epoch, epochs=start_epoch+epochs)
     print("Training complete.")
