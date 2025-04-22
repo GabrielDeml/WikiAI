@@ -13,6 +13,7 @@ import os
 from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoTokenizer
+from transformers import AdamW, get_linear_schedule_with_warmup
 import glob
 from torch.amp import autocast, GradScaler
 import subprocess
@@ -44,7 +45,7 @@ if device.type == "cuda":
 TOKENIZER_NAME = "microsoft/codebert-base"  # Code-aware tokenizer
 # Load the tokenizer from HuggingFace
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-MAX_LEN = 20  # Maximum sequence length for input/output
+MAX_LEN = 128  # Maximum sequence length for input/output
 
 # --- Wikipedia streaming and tokenization utilities ---
 
@@ -65,7 +66,7 @@ def pairwise_sentences(article):
     for i in range(len(lines) - 1):
         yield lines[i], lines[i + 1]
 
-def gen_tokenized_pairs(max_pairs=5000):
+def gen_tokenized_pairs(max_pairs=100000):
     """
     Streams Wikipedia articles and yields tokenized (input, response) pairs up to max_pairs.
     Each pair is tokenized and padded to MAX_LEN.
@@ -98,7 +99,7 @@ class WikiChatIterableDataset(IterableDataset):
     """
     Iterable PyTorch dataset that streams Wikipedia and yields tokenized (input, response) pairs.
     """
-    def __init__(self, max_pairs=5000):
+    def __init__(self, max_pairs=100000):
         super().__init__()
         self.max_pairs = max_pairs
 
@@ -171,7 +172,6 @@ class TransformerChatbot(nn.Module):
     Sequence-to-sequence transformer model for chatbot response generation.
     """
     def __init__(self, vocab_size, d_model=512, nhead=8, num_encoder_layers=8, num_decoder_layers=8, dim_feedforward=8192, dropout=0.1):
-        super(TransformerChatbot, self).__init__()
         
         # Embedding layer for tokens
         self.embedding = nn.Embedding(vocab_size, d_model)
