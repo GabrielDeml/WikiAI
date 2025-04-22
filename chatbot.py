@@ -7,7 +7,7 @@ import glob
 import os
 
 # Tokenizer and constants
-TOKENIZER_NAME = "bert-base-uncased"
+TOKENIZER_NAME = "microsoft/codebert-base"
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 MAX_LEN = 20
 
@@ -32,7 +32,7 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1)]
 
 class TransformerChatbot(nn.Module):
-    def __init__(self, vocab_size, d_model=64, nhead=4, num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=128, dropout=0.1):
+    def __init__(self, vocab_size, d_model=512, nhead=8, num_encoder_layers=8, num_decoder_layers=8, dim_feedforward=8192, dropout=0.1):
         super(TransformerChatbot, self).__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.positional_encoding = PositionalEncoding(d_model)
@@ -91,13 +91,14 @@ def generate_response(model, input_text, tokenizer, device, max_length=20, tempe
     return tokenizer.decode(output_ids, skip_special_tokens=True)
 
 def find_latest_checkpoint():
-    checkpoint_files = glob.glob('models/chatbot_epoch_*.pth')
+    """
+    Finds the latest model checkpoint in the models directory.
+    Returns the path to the most recently modified .pth file, or None if none found.
+    """
+    checkpoint_files = glob.glob('models/*.pth')
     if checkpoint_files:
         return max(checkpoint_files, key=os.path.getctime)
-    elif os.path.exists('transformer_chatbot.pth'):
-        return 'transformer_chatbot.pth'
-    else:
-        return None
+    return None
 
 def main():
     device = get_device()
